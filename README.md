@@ -206,4 +206,4 @@ java -jar target/labso-client-1.0.0-all.jar 127.0.0.1 9000
 
 ## Licenza
 
-Progetto didattico universitario (imposta la licenza che preferisci, es. MIT o Unlicense).
+Progetto didattico universitario.
