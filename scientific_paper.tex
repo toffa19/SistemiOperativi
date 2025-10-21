@@ -1,0 +1,974 @@
+\documentclass[a4paper,12pt]{article}
+
+% --- Pacchetti base (ASCII-safe per pdfLaTeX/MiKTeX) ---
+\usepackage[utf8]{inputenc}
+\usepackage[italian]{babel}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{amsmath} % utile per \text e formattazioni varie
+\usepackage{listings}
+\usepackage{inconsolata} % monospaced leggibile
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref} % tenere per ultimo tra i pacchetti tipografici
+
+% --- Stile listing ---
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  showstringspaces=false,
+  tabsize=2
+}
+\lstset{style=code}
+
+% --- Dati documento (modifica qui) ---
+\newcommand{\GroupName}{<NOME GRUPPO>}
+\newcommand{\ReferenteEmail}{referente@studio.unibo.it}
+\newcommand{\Members}{%
+  \begin{tabular}{@{}ll@{}}
+  Christian Toffalori & Matricola \\
+  Sara Alfieri         & Matricola \\
+  Nome Cognome         & Matricola \\
+  \end{tabular}
+}
+
+\title{\textbf{Laboratorio di Sistemi Operativi A.A. 2024-25}\\[4pt]
+Documentazione Tecnica del Progetto P2P con Master Registry}
+\author{\GroupName\\ \small Referente: \texttt{\ReferenteEmail}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Componenti del gruppo}
+\Members
+
+\tableofcontents
+\newpage
+
+% =========================================================
+\section{Introduzione}
+Questo documento descrive un sistema \textbf{peer-to-peer} con \textbf{registro centrale} (Master) che rispetta le specifiche del progetto di Laboratorio di Sistemi Operativi A.A.\ 2024--25. Il Master mantiene la mappatura tra risorse e peer; i peer si registrano, pubblicano risorse e scaricano risorse da altri peer tramite un protocollo testuale su socket.
+
+\paragraph{Obiettivi principali}
+\begin{itemize}[nosep]
+  \item Architettura P2P con Master centrale.
+  \item Mutua esclusione sul Master durante aggiornamenti/consultazioni del registro.
+  \item Mutua esclusione sul Peer (serve una richiesta alla volta).
+  \item Download con token e retry robusto in caso di fallimenti.
+  \item CLI per Master e Peer, con log delle richieste di download.
+\end{itemize}
+
+% =========================================================
+\section{Architettura del sistema}
+\subsection{Vista di alto livello}
+\begin{itemize}[nosep]
+  \item \textbf{Master}: server TCP concorrente. Mantiene:
+  \begin{itemize}[nosep]
+    \item Registro \texttt{risorsa -> [peerId]} e \texttt{peerId -> PeerRef(host,port)}.
+    \item Emissione/revoca dei token di download.
+    \item Log centrale delle richieste di download (esito OK/FAIL).
+  \end{itemize}
+  \item \textbf{Peer}: client del Master + server interno per servire file; mantiene una cartella risorse locale. 
+\end{itemize}
+
+\subsection{Struttura del repository}
+\begin{lstlisting}
+labso-p2p/
+|-- pom.xml
+|-- README.md
+|-- run/
+|   |-- start-master.sh
+|   |-- start-peer-a.sh
+|   |-- start-peer-b.sh
+|   `-- windows/
+|       |-- start-master.bat
+|       |-- start-peer-a.bat
+|       `-- start-peer-b.bat
+|-- data/
+|   |-- peer-A/
+|   |   `-- R1.txt
+|   `-- peer-B/
+|       `-- R2.txt
+|-- logs/
+`-- src/
+    `-- main/
+        |-- java/
+        |   `-- it/unibo/labso/p2p/
+        |       |-- common/
+        |       |-- master/
+        |       `-- peer/
+        `-- resources/
+\end{lstlisting}
+
+\subsection{Componenti principali}
+\begin{itemize}
+  \item \textbf{MasterServer}: ciclo \texttt{accept()} + thread-pool; passa ogni socket a \texttt{ClientHandler}.
+  \item \textbf{ClientHandler}: interpreta comandi testuali (payload JSON).
+  \item \textbf{Registry}: tabelle del registro con lock unico (mutua esclusione stretta).
+  \item \textbf{TokenStore}: genera/gestisce \texttt{Token} con scadenza.
+  \item \textbf{DownloadLog}: conserva eventi \texttt{(ts, risorsa, da, a, esito)}.
+  \item \textbf{PeerServer}: server socket con \texttt{Semaphore(1)} per servire una richiesta per volta.
+  \item \textbf{PeerClient}: effettua download byte-precise senza chiudere prematuramente il socket.
+  \item \textbf{MasterClient}: API lato peer per parlare col Master.
+  \item \textbf{PeerCli}: interfaccia interattiva utente (peer).
+\end{itemize}
+
+% =========================================================
+\section{Protocollo di rete (Master <-> Peer)}
+I comandi sono line-based (UTF-8, terminati da \verb|\n|). Formato: \texttt{<CMD> [JSON]}.  
+Il Master risponde sempre con: \texttt{OK [JSON]} oppure \texttt{ERR <motivo>}.
+
+\subsection*{Comandi supportati (Master)}
+\begin{longtable}{@{}p{3.6cm}p{9.5cm}@{}}
+\toprule
+\textbf{CMD} & \textbf{Descrizione (JSON payload)} \\
+\midrule
+\texttt{REGISTER} & Registra/aggiorna peer e lista risorse. \\
+\texttt{LISTDATA\_REMOTE} & Restituisce mappa globale \texttt{risorsa -> [peerId]}. \\
+\texttt{LIST\_PEERS} & Restituisce mappa \texttt{peerId -> PeerRef(host,port)}. \\
+\texttt{WHO\_HAS} & \texttt{\{"resource": "<nome>"\}} -> lista di \texttt{PeerRef}. \\
+\texttt{DOWNLOAD\_TOKEN\_REQ} & \texttt{\{"resource": "<nome>", "requesterPeerId": "<id>"\}} -> \texttt{\{"token","resource","peer"\}}. \\
+\texttt{DOWNLOAD\_TOKEN\_REL} & \texttt{\{"token","resource","fromPeerId","requesterPeerId"\}} (rilascio token, log esito OK). \\
+\texttt{DOWNLOAD\_FAILED} & \texttt{\{"resource","peerId","requesterPeerId"\}} (rimuove associazione e logga FAIL). \\
+\texttt{PEER\_QUIT} & \texttt{\{"peerId"\}} (rimuove peer e risorse dal registro). \\
+\texttt{QUIT} & Chiude la connessione corrente. \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Comandi Peer -> Peer}
+\begin{longtable}{@{}p{3.6cm}p{9.5cm}@{}}
+\toprule
+\textbf{CMD} & \textbf{Descrizione} \\
+\midrule
+\texttt{DOWNLOAD <nome> <token>} & Il peer server risponde \texttt{OK <size>} e invia esattamente \texttt{size} byte. Con \textbf{Semaphore(1)} serve una richiesta alla volta. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Sequenza di download e retry}
+\begin{enumerate}[nosep]
+  \item Peer richiede token: \texttt{DOWNLOAD\_TOKEN\_REQ\{"resource","requesterPeerId"\}}.
+  \item Master risponde con \texttt{OK \{"token","resource","peer"\}}.
+  \item Peer si connette a \texttt{peer.host:peer.port} e invia \texttt{DOWNLOAD <nome> <token>}.
+  \item In caso di errore: \texttt{DOWNLOAD\_FAILED\{"resource","peerId","requesterPeerId"\}} e ritorna al passo 1.
+  \item Se ok: salva file e invia \texttt{DOWNLOAD\_TOKEN\_REL\{"token","resource","fromPeerId","requesterPeerId"\}}.
+\end{enumerate}
+
+% =========================================================
+\section{Comandi CLI (utente)}
+\subsection*{Master (console)}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{Comando} & \textbf{Descrizione} \\
+\midrule
+\texttt{listdata} & Stampa mappa globale \texttt{risorsa -> [peerId]}. \\
+\texttt{inspectNodes} & Stampa mappa \texttt{peerId -> PeerRef}. \\
+\texttt{log} & Stampa elenco eventi di download con esito (OK/FAIL). \\
+\texttt{quit} & Arresta il master (shutdown pulito). \\
+\bottomrule
+\end{tabularx}
+
+\subsection*{Peer (console)}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{Comando} & \textbf{Descrizione} \\
+\midrule
+\texttt{listdata local} & Elenca file nella cartella del peer. \\
+\texttt{listdata remote} & Mostra indice globale dal Master. \\
+\texttt{listpeers} & Mostra tutti i peer registrati. \\
+\texttt{whohas <nome>} & Mostra i peer che hanno \texttt{<nome>}. \\
+\texttt{add <nome> <contenuto>} & Crea file locale e aggiorna il Master. \\
+\texttt{download <nome>} & Scarica da un altro peer con token e retry robusto. \\
+\texttt{quit} & Deregistra il peer presso il Master e chiude. \\
+\bottomrule
+\end{tabularx}
+
+% =========================================================
+\section{Concorrenza e sincronizzazione}
+\subsection{Master}
+La struttura dati del registro e' protetta da un unico \texttt{ReentrantLock} (mutua esclusione stretta). In questo modo, durante gli aggiornamenti nessuna lettura procede in parallelo, aderendo alla specifica che richiede uso in mutua esclusione durante update/uso della tabella.
+
+\subsection{Peer}
+Il \texttt{PeerServer} utilizza \texttt{Semaphore(1)} per serializzare la gestione delle richieste di download: mentre due peer A e B comunicano, il peer B serve una sola richiesta per volta e le altre restano in attesa.
+
+% =========================================================
+\section{Istruzioni di build ed esecuzione}
+\subsection*{Prerequisiti}
+\begin{itemize}[nosep]
+  \item Java LTS (testato con 21; la specifica menziona 24 LTS: adeguare \texttt{maven.compiler.release} se richiesto).
+  \item Maven (o Maven bundled di IntelliJ).
+\end{itemize}
+
+\subsection*{Build}
+\begin{lstlisting}[language=bash]
+cd labso-p2p
+mvn clean package -Pdist
+# genera: target/labso-p2p-1.0.0-all.jar
+\end{lstlisting}
+
+\subsection*{Esecuzione (demo locale)}
+\begin{lstlisting}[language=bash]
+# Shell 1 - Master
+java -cp target/labso-p2p-1.0.0-all.jar it.unibo.labso.p2p.master.MasterMain 9000
+
+# Shell 2 - Peer A
+java -cp target/labso-p2p-1.0.0-all.jar it.unibo.labso.p2p.peer.PeerMain 127.0.0.1 9000 ./data/peer-A
+
+# Shell 3 - Peer B
+java -cp target/labso-p2p-1.0.0-all.jar it.unibo.labso.p2p.peer.PeerMain 127.0.0.1 9000 ./data/peer-B
+\end{lstlisting}
+
+% =========================================================
+\section{Test e casi attesi}
+\subsection*{Percorso consigliato}
+\begin{enumerate}[nosep]
+  \item Peer A: \texttt{listdata local}, \texttt{add R3.txt hello}, \texttt{listdata remote}.
+  \item Peer B: \texttt{listdata remote}, \texttt{whohas R3.txt}, \texttt{download R3.txt}.
+  \item Master: \texttt{log} mostra evento OK, \texttt{inspectNodes} mostra peer attivi.
+  \item Retry: spegnere il peer sorgente durante \texttt{download}; il peer client mostra \texttt{retrying...} e invia \texttt{DOWNLOAD\_FAILED}. Se non restano candidati, Master risponde \texttt{ERR NO\_RESOURCE}.
+  \item Deregistrazione: \texttt{quit} su un peer; \texttt{inspectNodes} e \texttt{listdata} dal Master non devono piu' includerlo.
+\end{enumerate}
+
+\subsection*{Mutua esclusione lato peer}
+Creare un file grande su \texttt{peer-A}, avviare due \texttt{download} paralleli da B: si osserva che uno parte solo quando l'altro termina (Semaphore(1)).
+
+% =========================================================
+\section{Copertura delle specifiche}
+\begin{longtable}{@{}p{4.5cm}p{6.8cm}p{4.5cm}@{}}
+\toprule
+\textbf{Requisito} & \textbf{Implementazione} & \textbf{File principali} \\
+\midrule
+Gruppi/Repo/Consegna & Struttura Maven, repo privato, tag \texttt{Consegna}. & \texttt{pom.xml}, README \\
+Master registra risorse & \texttt{REGISTER} con lock unico. & \texttt{Registry}, \texttt{ClientHandler} \\
+Lista risorse globale & \texttt{LISTDATA\_REMOTE}. & \texttt{ClientHandler}, \texttt{MasterMain} \\
+Lista peer e WhoHas & \texttt{LIST\_PEERS}, \texttt{WHO\_HAS}. & \texttt{ClientHandler}, \texttt{MasterClient} \\
+Download token-based & \texttt{DOWNLOAD\_TOKEN\_REQ/REL}. & \texttt{ClientHandler}, \texttt{TokenStore} \\
+Retry robusto & \texttt{DOWNLOAD\_FAILED} + loop nel peer. & \texttt{PeerCli}, \texttt{MasterClient} \\
+Mutua esclusione Master & Lock unico su \texttt{Registry}. & \texttt{Registry} \\
+Mutua esclusione Peer & \texttt{Semaphore(1)} nel server del peer. & \texttt{PeerServer}, \texttt{PeerRequestHandler} \\
+Deregistrazione peer & \texttt{PEER\_QUIT} su \texttt{quit}. & \texttt{PeerCli}, \texttt{ClientHandler} \\
+CLI Master & \texttt{listdata}, \texttt{inspectNodes}, \texttt{log}, \texttt{quit}. & \texttt{MasterMain} \\
+Log dei download & \texttt{DownloadLog} (OK/FAIL). & \texttt{DownloadLog}, \texttt{ClientHandler} \\
+Messaggi d'errore chiari & Peer stampa errore se Master non raggiungibile. & \texttt{PeerMain} \\
+\bottomrule
+\end{longtable}
+
+% =========================================================
+\section{Scelte progettuali e alternative}
+\subsection*{Lock unico vs ReadWriteLock (Master)}
+Scelta: lock unico per aderire rigorosamente alla specifica (nessuna lettura parallela durante aggiornamenti). 
+Alternativa: ReadWriteLock (maggiore parallelismo in sola lettura) ma meno “stretta”.
+
+\subsection*{Validazione token lato peer}
+Non richiesta; possibile estensione: prima di servire \texttt{DOWNLOAD}, il peer valida il token chiedendo al Master. Pro: maggiore robustezza; Contro: overhead di round-trip.
+
+\subsection*{Indice risorse filtrato}
+Per evitare indicizzazione di file scaricati (\texttt{downloaded\_*}), si filtra lato peer in \texttt{ResourceManager.list()}.
+
+% =========================================================
+\section{Istruzioni di consegna (promemoria)}
+\begin{itemize}[nosep]
+  \item Repo privato \texttt{LABSO <NOME GRUPPO>} su GitHub/GitLab.
+  \item Aggiungere tutor come collaboratori (come da specifiche).
+  \item Tag \texttt{Consegna} con messaggio non vuoto.
+  \item Email di notifica con link repo e allegato \texttt{DOCUMENTAZIONE.pdf}.
+\end{itemize}
+
+% =========================================================
+\section{Conclusioni}
+Il sistema soddisfa i requisiti della specifica:
+\begin{itemize}[nosep]
+  \item Registro centrale coerente, protetto da mutua esclusione.
+  \item Peer server serializzato (Semaphore(1)).
+  \item Download con token, retry robusto e log centralizzato.
+  \item CLI utili per ispezione e diagnosi.
+\end{itemize}
+Estensioni possibili: validazione token lato peer, persistenza del registro su disco, policy avanzate di scelta del peer sorgente (round-robin, load-aware).
+
+% =========================================================
+\appendix
+
+\section{Codice lato Master: classi, porzioni rilevanti e collegamenti}
+
+Tutte le classi del Master risiedono nel package \texttt{it.unibo.labso.p2p.master} e dipendono da DTO/utility comuni nel package \texttt{it.unibo.labso.p2p.common} (\texttt{PeerRef}, \texttt{Token}, \texttt{NetUtils}, \texttt{JsonCodec}). Di seguito il dettaglio per classe con estratti \emph{illustrativi} del codice, collegamenti fra componenti e motivazioni progettuali basate sull’implementazione effettiva.
+
+\subsection*{MasterMain.java}
+Punto di ingresso. Legge la porta (default 9000, sovrascrivibile dal primo argomento), avvia il server e presenta la CLI amministrativa minimale.
+\begin{itemize}[nosep]
+  \item Parsing robusto della porta con fallback e \emph{usage} in caso di input non valido.
+  \item REPL semplice: legge una riga, \emph{switch} sul comando e delega a \texttt{MasterServer} tramite accessor.
+\end{itemize}
+
+\begin{lstlisting}
+int port = 9000;
+if (args.length > 0) {
+  try { port = Integer.parseInt(args[0]); }
+  catch (NumberFormatException e) {
+    System.err.println("usage: MasterMain <port>");
+    return;
+  }
+}
+MasterServer server = new MasterServer(port);
+server.start();
+while (true) {
+  String cmd = in.readLine();
+  if (cmd == null) break;
+  switch (cmd) {
+    case "listdata"     -> System.out.println(server.registry().snapshotAll());
+    case "inspectNodes" -> System.out.println(server.registry().snapshotPeers());
+    case "log"          -> System.out.println(server.downloadLog().snapshot());
+    case "quit"         -> { server.shutdown(); System.out.println("[MASTER] bye"); return; }
+    default             -> System.out.println("listdata | inspectNodes | log | quit");
+  }
+}
+\end{lstlisting}
+
+Scelta progettuale: la CLI vive nel \texttt{main} per tenerla indipendente dal protocollo e garantire visibilità immediata sullo stato interno (\texttt{Registry}, \texttt{DownloadLog}).
+
+\subsection*{MasterServer.java}
+Accetta connessioni TCP e delega ogni socket a \texttt{ClientHandler} eseguito su un pool. Mantiene i componenti condivisi e fornisce accessor usati dalla CLI.
+\begin{itemize}[nosep]
+  \item Campi principali: \texttt{ServerSocket serverSocket}, \texttt{ExecutorService pool}, \texttt{Registry registry}, \texttt{TokenStore tokens}, \texttt{DownloadLog downloadLog}.
+  \item \texttt{start()} avvia il ciclo di \texttt{accept()} e sottomette un \texttt{ClientHandler} per ogni connessione.
+  \item \texttt{shutdown()} chiude ordinatamente socket e pool; \texttt{closeServerSocketQuietly()} gestisce eccezioni in chiusura.
+\end{itemize}
+
+\begin{lstlisting}
+/** Accetta connessioni e delega al ClientHandler. */
+final class MasterServer {
+  private final int port;
+  private volatile boolean running;
+  private ServerSocket serverSocket;
+  private final ExecutorService pool = Executors.newCachedThreadPool();
+  private final Registry registry = new Registry();
+  private final TokenStore tokens = new TokenStore();
+  private final DownloadLog downloadLog = new DownloadLog();
+
+  Registry registry() { return registry; }
+  TokenStore tokens() { return tokens; }
+  DownloadLog downloadLog() { return downloadLog; }
+
+  void start() throws IOException {
+    running = true;
+    serverSocket = new ServerSocket(port);
+    while (running) {
+      Socket s = serverSocket.accept();
+      pool.submit(new ClientHandler(s, registry, tokens, downloadLog));
+    }
+  }
+
+  void shutdown() {
+    running = false;
+    closeServerSocketQuietly();
+    pool.shutdownNow();
+  }
+}
+\end{lstlisting}
+
+Scelta progettuale: server “sottile” e componibile; la logica del protocollo è tutta nel \texttt{ClientHandler}, lo stato condiviso resta centralizzato e facilmente ispezionabile.
+
+\subsection*{ClientHandler.java}
+Implementa \texttt{Runnable} e gestisce il protocollo Master\,$\leftrightarrow$\,Peer: I/O line-based, payload JSON con \texttt{JsonCodec}. Interagisce con \texttt{Registry}, \texttt{TokenStore} e \texttt{DownloadLog}.
+\begin{itemize}[nosep]
+  \item Comandi: \texttt{REGISTER}, \texttt{LISTDATA\_REMOTE}, \texttt{LIST\_PEERS}, \texttt{WHO\_HAS}, \texttt{DOWNLOAD\_TOKEN\_REQ}, \texttt{DOWNLOAD\_TOKEN\_REL}, \texttt{DOWNLOAD\_FAILED}, \texttt{PEER\_QUIT}, \texttt{QUIT}.
+  \item DTO interni (record) per il parse del JSON: \texttt{RegisterReq}, \texttt{ListResp}, \texttt{PeersResp}, \texttt{WhoHasReq}, \texttt{TokenReq}, \texttt{TokenResp}, \texttt{TokenRel}, \texttt{DownloadFailedReq}, \texttt{PeerQuitReq}.
+  \item Politiche: scelta del primo candidato da \texttt{Registry.whoHas(resource)}; token con TTL fisso; su \texttt{DOWNLOAD\_FAILED} rimozione dell’associazione \texttt{peerId,resource} e tracciamento nel log.
+\end{itemize}
+
+\begin{lstlisting}
+switch (cmd) {
+  case "REGISTER" -> {
+    var req = JsonCodec.fromJson(json, RegisterReq.class);
+    registry.upsertPeer(req.ref(), req.resources());
+    NetUtils.sendLine(out, "OK");
+  }
+  case "WHO_HAS" -> {
+    var req = JsonCodec.fromJson(json, WhoHasReq.class);
+    var peers = registry.whoHas(req.resource());
+    NetUtils.sendLine(out, "OK " + JsonCodec.toJson(new PeersResp(peers)));
+  }
+  case "DOWNLOAD_TOKEN_REQ" -> {
+    var req = JsonCodec.fromJson(json, TokenReq.class);
+    var candidates = registry.whoHas(req.resource());
+    var chosen = candidates.isEmpty() ? null : candidates.get(0);
+    if (chosen == null) { NetUtils.sendLine(out, "ERR NO_RESOURCE"); break; }
+    var tok = tokens.issue(req.resource(), req.requesterPeerId(), Duration.ofSeconds(60));
+    NetUtils.sendLine(out, "OK " + JsonCodec.toJson(new TokenResp(tok, chosen)));
+  }
+  case "DOWNLOAD_TOKEN_REL" -> {
+    var rel = JsonCodec.fromJson(json, TokenRel.class);
+    tokens.revoke(rel.token());
+    downloadLog.addSuccess(rel.resource(), rel.fromPeerId(), rel.requesterPeerId());
+    NetUtils.sendLine(out, "OK");
+  }
+  case "DOWNLOAD_FAILED" -> {
+    var fail = JsonCodec.fromJson(json, DownloadFailedReq.class);
+    registry.removePeerResource(fail.fromPeerId(), fail.resource());
+    downloadLog.addFailure(fail.resource(), fail.fromPeerId(), fail.requesterPeerId());
+    NetUtils.sendLine(out, "OK");
+  }
+  case "PEER_QUIT" -> { /* deregistrazione */ }
+  case "QUIT"     -> { /* chiusura socket */ }
+  default -> NetUtils.sendLine(out, "ERR UNKNOWN_CMD");
+}
+\end{lstlisting}
+
+Scelte progettuali:
+\begin{enumerate}[nosep]
+  \item Line-based + JSON per un parsing semplice e estendibile.
+  \item Token con TTL per evitare riusi accidentali/malevoli; revoca esplicita su \texttt{DOWNLOAD\_TOKEN\_REL}.
+  \item Pulizia del registro su \texttt{DOWNLOAD\_FAILED} per favorire il retry verso altri peer.
+\end{enumerate}
+
+\subsection*{Registry.java}
+Registro coerente con lock unico (\texttt{ReentrantLock}) su tutte le operazioni, incluse le letture \emph{snapshot}, per rispettare il vincolo di mutua esclusione anche in consultazione.
+\begin{itemize}[nosep]
+  \item Strutture: \texttt{Map<String, Set<String>> resourceToPeers}, \texttt{Map<String, PeerRef> peerIdToRef}, \texttt{Map<String, Set<String>> peerToResources}.
+  \item Operazioni principali: \texttt{upsertPeer(PeerRef, Set<String>)}, \texttt{removePeer(String)}, \texttt{removePeerResource(String,String)}, \texttt{whoHas(String)}, \texttt{snapshotAll()}, \texttt{snapshotPeers()}.
+\end{itemize}
+
+\begin{lstlisting}
+/** Registro risorse <-> peer con mutua esclusione "stretta". */
+final class Registry {
+  private final Lock lock = new ReentrantLock();
+  private final Map<String, Set<String>> resourceToPeers = new HashMap<>();
+  private final Map<String, PeerRef>     peerIdToRef     = new HashMap<>();
+  private final Map<String, Set<String>> peerToResources = new HashMap<>();
+
+  void removePeerResource(String peerId, String resource) {
+    lock.lock();
+    try {
+      var res = peerToResources.get(peerId);
+      if (res != null) { res.remove(resource); if (res.isEmpty()) peerToResources.remove(peerId); }
+      var ids = resourceToPeers.get(resource);
+      if (ids != null) { ids.remove(peerId); if (ids.isEmpty()) resourceToPeers.remove(resource); }
+    } finally { lock.unlock(); }
+  }
+}
+\end{lstlisting}
+
+Scelte progettuali:
+\begin{itemize}[nosep]
+  \item Lock unico (anziché \texttt{ReadWriteLock}) per garantire assenza di letture durante update, come richiesto.
+  \item Mantenimento simmetrico degli indici \emph{forward} e \emph{reverse} per query e stampe immediate (usate dalla CLI).
+\end{itemize}
+
+\subsection*{TokenStore.java}
+Gestione token thread-safe con \texttt{ConcurrentHashMap}. Ogni token ha valore (UUID), risorsa, destinatario e scadenza.
+\begin{itemize}[nosep]
+  \item \texttt{issue(resource,toPeerId,ttl)} crea e indicizza il token.
+  \item \texttt{get(value)} valida la scadenza; rimuove i token scaduti.
+  \item \texttt{revoke(value)} rimuove il token al termine del download.
+\end{itemize}
+
+\begin{lstlisting}
+final class TokenStore {
+  private final Map<String, Token> byValue = new ConcurrentHashMap<>();
+
+  Token issue(String resource, String toPeerId, Duration ttl) {
+    Token t = new Token(/* uuid, resource, toPeerId, expiresAt */);
+    byValue.put(t.value(), t);
+    return t;
+  }
+
+  Optional<Token> get(String value) {
+    Token t = byValue.get(value);
+    if (t == null) return Optional.empty();
+    if (Instant.now().isAfter(t.expiresAt())) { byValue.remove(value); return Optional.empty(); }
+    return Optional.of(t);
+  }
+  void revoke(String value) { byValue.remove(value); }
+}
+\end{lstlisting}
+
+Scelta progettuale: \texttt{ConcurrentHashMap} evita lock espliciti sui path veloci, mantenendo semplice la semantica.
+
+\subsection*{DownloadLog.java}
+Log append-only degli esiti con timestamp e peer coinvolti. \texttt{List<Entry>} sincronizzata; \texttt{snapshot()} espone una vista immutabile per la CLI.
+\begin{lstlisting}
+final class DownloadLog {
+  static final class Entry {
+    final Instant ts = Instant.now();
+    final String resource, fromPeerId, toPeerId;
+    final boolean ok;
+    public String toString() {
+      return ts + " " + resource + " da:" + fromPeerId + " a:" + toPeerId
+             + " esito:" + (ok ? "OK" : "FAIL");
+    }
+  }
+  private final List<Entry> entries =
+      Collections.synchronizedList(new ArrayList<>());
+  void addSuccess(String r, String from, String to) { entries.add(new Entry(r, from, to, true)); }
+  void addFailure(String r, String from, String to) { entries.add(new Entry(r, from, to, false)); }
+  List<Entry> snapshot() { return List.copyOf(entries); }
+}
+\end{lstlisting}
+
+Scelta progettuale: lista sincronizzata sufficiente per append concorrente; \texttt{List.copyOf} evita esposizione di stato mutabile.
+
+\subsection*{MasterCli.java}
+Wrapper minimale che stampa un promemoria dei comandi; la logica del REPL resta nel \texttt{main}.
+\begin{lstlisting}
+public class MasterCli implements Runnable {
+  @Override public void run() {
+    System.out.println("master> listdata | inspectNodes | log | quit");
+  }
+}
+\end{lstlisting}
+
+\subsection*{Collegamenti e flusso complessivo}
+\begin{enumerate}[nosep]
+  \item \texttt{MasterMain} avvia \texttt{MasterServer} e presenta la CLI.
+  \item \texttt{MasterServer} accetta connessioni e istanzia \texttt{ClientHandler}, passando \texttt{Registry}, \texttt{TokenStore}, \texttt{DownloadLog}.
+  \item \texttt{ClientHandler} legge righe, fa il parse JSON con \texttt{JsonCodec}, invoca \texttt{Registry}/\texttt{TokenStore} e risponde con \texttt{OK ...} o \texttt{ERR ...}.
+  \item \texttt{DownloadLog} traccia successi/fallimenti; la CLI legge \texttt{server.downloadLog().snapshot()}.
+\end{enumerate}
+
+\subsection*{Mappa comandi \texorpdfstring{$\rightarrow$}{->} componenti}
+\begin{tabular}{@{}p{4.2cm}p{10cm}@{}}
+\toprule
+Comando & Componenti coinvolti \\
+\midrule
+\texttt{REGISTER}            & ClientHandler $\rightarrow$ Registry.upsertPeer \\
+\texttt{LISTDATA\_REMOTE}    & ClientHandler $\rightarrow$ Registry.snapshotAll \\
+\texttt{LIST\_PEERS}         & ClientHandler $\rightarrow$ Registry.snapshotPeers \\
+\texttt{WHO\_HAS}            & ClientHandler $\rightarrow$ Registry.whoHas \\
+\texttt{DOWNLOAD\_TOKEN\_REQ}& ClientHandler $\rightarrow$ Registry.whoHas, TokenStore.issue \\
+\texttt{DOWNLOAD\_TOKEN\_REL}& ClientHandler $\rightarrow$ TokenStore.revoke, DownloadLog.addSuccess \\
+\texttt{DOWNLOAD\_FAILED}    & ClientHandler $\rightarrow$ Registry.removePeerResource, DownloadLog.addFailure \\
+\texttt{PEER\_QUIT}          & ClientHandler $\rightarrow$ Registry.removePeer \\
+\bottomrule
+\end{tabular}
+
+
+\section{Codice lato Peer: classi, porzioni rilevanti e collegamenti}
+
+Le classi del peer risiedono nel package \texttt{it.unibo.labso.p2p.client} (o equivalente nel tuo progetto) e collaborano tra loro per: mantenere le risorse locali, esporre un piccolo server TCP serializzato (\texttt{Semaphore(1)}), comunicare con il Master per scoprire i sorgenti e ottenere i token, e fornire una CLI utente. Di seguito dettaglio per classe, con estratti illustrativi, collegamenti e motivazioni progettuali.
+
+\subsection*{PeerMain.java}
+Punto di ingresso del peer. Legge host/porta del Master dalla riga di comando, costruisce i componenti e avvia \texttt{PeerServer} in un thread dedicato, quindi entra nella CLI.
+\begin{itemize}[nosep]
+  \item Argomenti attesi: \texttt{<masterHost> <masterPort>}.
+  \item Inizializza \texttt{ResourceManager} (cartella dati locale), \texttt{MasterClient} per parlare col Master, \texttt{PeerServer} per servire file in ingresso, \texttt{PeerCli} per i comandi interattivi.
+\end{itemize}
+
+\begin{lstlisting}
+public static void main(String[] args) throws Exception {
+  if (args.length != 2) { System.err.println("usage: PeerMain <masterHost> <masterPort>"); return; }
+  String masterHost = args[0]; int masterPort = Integer.parseInt(args[1]);
+
+  ResourceManager rm = new ResourceManager(Path.of("./data/peer"));
+  MasterClient master = new MasterClient(masterHost, masterPort);
+  PeerServer server = new PeerServer(rm /*, ownPort auto/bind */);
+  new Thread(server, "peer-server").start();
+
+  // registra le risorse iniziali presso il Master
+  master.register(rm.localPeerRef(), rm.listResources());
+
+  // avvia la CLI
+  new PeerCli(rm, master, server, new PeerClient(rm, master)).run();
+}
+\end{lstlisting}
+
+Scelta progettuale: \emph{composition root} nel \texttt{main} per costruire e cablare tutti i componenti in modo esplicito; \texttt{PeerServer} su thread dedicato per non bloccare la CLI.
+
+\subsection*{PeerServer.java}
+Piccolo server TCP che serve una sola richiesta alla volta, come da requisito. Trasferisce byte in modo deterministico dopo aver validato il token.
+\begin{itemize}[nosep]
+  \item Campi principali: \texttt{ServerSocket server}, \texttt{Semaphore gate = new Semaphore(1)}, \texttt{ResourceManager rm}, porta di ascolto (espone \texttt{PeerRef} con host/porta reali).
+  \item \texttt{run()}: ciclo \texttt{accept()}; per ogni socket sottomette a \texttt{PeerRequestHandler} la gestione della singola richiesta \emph{dopo} aver acquisito la \texttt{Semaphore(1)}.
+\end{itemize}
+
+\begin{lstlisting}
+/** Server del peer: serve una richiesta alla volta (Semaphore(1)). */
+final class PeerServer implements Runnable {
+  private final ServerSocket server;
+  private final Semaphore gate = new Semaphore(1);
+  private final ResourceManager rm;
+
+  public void run() {
+    while (!server.isClosed()) {
+      try {
+        Socket s = server.accept();
+        // serializza: una sola richiesta alla volta
+        gate.acquire();
+        new Thread(new PeerRequestHandler(s, rm, gate), "peer-req").start();
+      } catch (IOException ignored) {}
+    }
+  }
+}
+\end{lstlisting}
+
+Scelta progettuale: \texttt{Semaphore(1)} garantisce mutua esclusione forte sull'erogazione dei contenuti, come richiesto, evitando interleaving di stream.
+
+\subsection*{PeerRequestHandler.java}
+Gestisce il singolo dialogo Peer\,$\rightarrow$\,Peer. Valida il formato del comando \texttt{DOWNLOAD <nome> <token>}, controlla l’esistenza della risorsa e invia \texttt{OK <size>} seguito da esattamente \texttt{size} byte.
+\begin{itemize}[nosep]
+  \item Alla fine rilascia sempre la \texttt{Semaphore} passata dal server, per sbloccare la prossima richiesta.
+  \item In caso di errore, risponde con \texttt{ERR <motivo>} e chiude la socket.
+\end{itemize}
+
+\begin{lstlisting}
+final class PeerRequestHandler implements Runnable {
+  private final Socket s;
+  private final ResourceManager rm;
+  private final Semaphore gate;
+  public void run() {
+    try (var in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+         var out = new BufferedWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8));
+         var raw = s.getOutputStream()) {
+
+      String line = in.readLine(); // es. "DOWNLOAD R1.txt <token>"
+      var parts = line.split("\\s+");
+      if (parts.length != 3 || !"DOWNLOAD".equals(parts[0])) { out.write("ERR MALFORMED\n"); out.flush(); return; }
+
+      String name = parts[1], token = parts[2];
+      if (!rm.exists(name)) { out.write("ERR NO_RESOURCE\n"); out.flush(); return; }
+      long size = rm.size(name);
+      out.write("OK " + size + "\n"); out.flush();
+
+      try (var file = rm.newInputStream(name)) { file.transferTo(raw); }
+    } catch (IOException e) {
+      // log locale opzionale
+    } finally { gate.release(); try { s.close(); } catch (IOException ignored) {} }
+  }
+}
+\end{lstlisting}
+
+Scelte progettuali: protocollo line-based minimale; header \texttt{OK <size>} per consentire al client di ricevere esattamente i byte attesi; rilascio \texttt{gate} in \texttt{finally} per evitare deadlock.
+
+\subsection*{ResourceManager.java}
+Astrazione del filesystem locale del peer: crea/legge file, espone dimensioni e lista delle risorse, costruisce il \texttt{PeerRef} (host, porta) da registrare sul Master.
+\begin{itemize}[nosep]
+  \item \texttt{add(name, bytes)} crea/aggiorna file.
+  \item \texttt{exists(name)}, \texttt{size(name)}, \texttt{newInputStream(name)} per il serving.
+  \item \texttt{listResources()} restituisce l’elenco per \texttt{REGISTER}.
+\end{itemize}
+
+\begin{lstlisting}
+final class ResourceManager {
+  private final Path root;
+  ResourceManager(Path root) { this.root = root; Files.createDirectories(root); }
+  boolean exists(String name)     { return Files.isRegularFile(root.resolve(name)); }
+  long size(String name)          { return Files.size(root.resolve(name)); }
+  InputStream newInputStream(String name) { return Files.newInputStream(root.resolve(name)); }
+  List<String> listResources()    { try (var s = Files.list(root)) {
+    return s.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).toList();
+  } }
+}
+\end{lstlisting}
+
+Scelta progettuale: incapsulare I/O su disco per separare la logica di rete dalla gestione file, rendendo testabili i componenti.
+
+\subsection*{MasterClient.java}
+Client lato peer verso il Master. Implementa i comandi del protocollo: \texttt{REGISTER}, \texttt{LISTDATA\_REMOTE}, \texttt{LIST\_PEERS}, \texttt{WHO\_HAS}, \texttt{DOWNLOAD\_TOKEN\_REQ}, \texttt{DOWNLOAD\_TOKEN\_REL}, \texttt{DOWNLOAD\_FAILED}, \texttt{PEER\_QUIT}.
+\begin{itemize}[nosep]
+  \item \texttt{register(PeerRef, List<String>)} invia \texttt{REGISTER} con payload JSON.
+  \item \texttt{whoHas(resource)} ritorna la lista dei candidati \texttt{PeerRef}.
+  \item \texttt{requestToken(resource, requesterPeerId)} restituisce \texttt{Token} e \texttt{PeerRef} scelto.
+  \item \texttt{releaseToken(...)} e \texttt{notifyFailed(...)} tracciano esito al Master.
+\end{itemize}
+
+\begin{lstlisting}
+TokenResp requestToken(String resource, String requesterPeerId) throws IOException {
+  var req = new TokenReq(resource, requesterPeerId);
+  NetUtils.sendLine(out, "DOWNLOAD_TOKEN_REQ " + JsonCodec.toJson(req));
+  String line = in.readLine();
+  if (!line.startsWith("OK ")) throw new IOException(line);
+  return JsonCodec.fromJson(line.substring(3), TokenResp.class);
+}
+\end{lstlisting}
+
+Scelta progettuale: centralizzare qui il protocollo verso il Master mantiene \texttt{PeerClient} privo di logica di controllo “globale”.
+
+\subsection*{PeerClient.java}
+Implementa il download attivo: data una risorsa, chiede al Master il token, si connette al peer sorgente, verifica l’header \texttt{OK <size>} e riceve i byte, con retry su errore.
+\begin{itemize}[nosep]
+  \item \texttt{download(resource)}: ciclo retry su lista candidati (se fallisce un candidato, invia \texttt{DOWNLOAD\_FAILED} e prova il successivo).
+  \item Su successo: salva su disco e invia \texttt{DOWNLOAD\_TOKEN\_REL}.
+\end{itemize}
+
+\begin{lstlisting}
+Path download(String resource) throws IOException {
+  // 1) token + peer sorgente scelto dal Master
+  var resp = master.requestToken(resource, rm.localPeerId());
+  var token = resp.token().value(); var src = resp.sourceRef();
+
+  try (var s = new Socket(src.host(), src.port());
+       var in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+       var out = new BufferedWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8));
+       var raw = s.getInputStream()) {
+
+    out.write("DOWNLOAD " + resource + " " + token + "\n"); out.flush();
+    String header = in.readLine(); // "OK <size>"
+    if (header == null || !header.startsWith("OK ")) throw new IOException("bad header");
+    long size = Long.parseLong(header.substring(3).trim());
+
+    Path dst = rm.resolve(resource);
+    try (var file = Files.newOutputStream(dst, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+      raw.transferTo(file);
+    }
+    master.releaseToken(resource, src.peerId(), rm.localPeerId(), token);
+    return dst;
+  } catch (IOException e) {
+    master.notifyFailed(resource, src.peerId(), rm.localPeerId());
+    throw e;
+  }
+}
+\end{lstlisting}
+
+Scelte progettuali:
+\begin{enumerate}[nosep]
+  \item Verifica header e dimensione per ricezione deterministica.
+  \item Retry guidato dal Master: su fallimento si “pulisce” il registro (\texttt{DOWNLOAD\_FAILED}) e si tenta un altro candidato.
+  \item Separazione netta: \texttt{MasterClient} per il controllo globale, \texttt{PeerClient} per il trasferimento dati.
+\end{enumerate}
+
+\subsection*{PeerCli.java}
+Interfaccia testuale interattiva per l’utente del peer. Fornisce i comandi richiesti dalla specifica.
+\begin{itemize}[nosep]
+  \item \texttt{listdata local}: elenca i file locali (\texttt{ResourceManager.listResources()}).
+  \item \texttt{listdata remote}: stampa l’indice globale (\texttt{MasterClient.listdataRemote()}).
+  \item \texttt{listpeers}, \texttt{whohas <nome>}, \texttt{add <nome> <contenuto>}, \texttt{download <nome>}, \texttt{quit}.
+\end{itemize}
+
+\begin{lstlisting}
+switch (cmd[0]) {
+  case "listdata" -> {
+    if ("local".equals(cmd[1])) rm.listResources().forEach(System.out::println);
+    else if ("remote".equals(cmd[1])) System.out.println(master.listdataRemote());
+  }
+  case "whohas"   -> System.out.println(master.whoHas(cmd[1]));
+  case "add"      -> { rm.add(cmd[1], cmd[2].getBytes(StandardCharsets.UTF_8));
+                       master.register(rm.localPeerRef(), rm.listResources()); }
+  case "download" -> { Path p = peerClient.download(cmd[1]); System.out.println("OK " + p); }
+  case "quit"     -> { master.peerQuit(rm.localPeerId()); server.shutdown(); return; }
+  default         -> System.out.println("listdata local|remote | listpeers | whohas <r> | add <r> <txt> | download <r> | quit");
+}
+\end{lstlisting}
+
+Scelta progettuale: la CLI aggiorna il Master dopo \texttt{add} per mantenere l’indice coerente; \texttt{quit} invia \texttt{PEER\_QUIT} e arresta il \texttt{PeerServer}.
+
+\subsection*{Collegamenti e flusso complessivo lato peer}
+\begin{enumerate}[nosep]
+  \item \texttt{PeerMain} costruisce \texttt{ResourceManager}, \texttt{MasterClient}, \texttt{PeerServer}, \texttt{PeerClient} e avvia la \texttt{PeerCli}.
+  \item \texttt{PeerServer} serializza le richieste in ingresso con \texttt{Semaphore(1)} e usa \texttt{PeerRequestHandler} per spedire i byte.
+  \item \texttt{PeerClient} usa \texttt{MasterClient} per ottenere token e sorgente; scarica i dati e notifica esito (\texttt{DOWNLOAD\_TOKEN\_REL} o \texttt{DOWNLOAD\_FAILED}).
+  \item \texttt{PeerCli} orchestra i comandi utente, aggiornando il Master dove necessario (\texttt{REGISTER}, \texttt{PEER\_QUIT}).
+\end{enumerate}
+
+\subsection*{Mappa comandi CLI \texorpdfstring{$\rightarrow$}{->} componenti}
+\begin{tabular}{@{}p{4.6cm}p{9.6cm}@{}}
+\toprule
+Comando & Componenti coinvolti \\
+\midrule
+\texttt{listdata local}   & PeerCli $\rightarrow$ ResourceManager.listResources \\
+\texttt{listdata remote}  & PeerCli $\rightarrow$ MasterClient.listdataRemote \\
+\texttt{listpeers}        & PeerCli $\rightarrow$ MasterClient.listPeers \\
+\texttt{whohas <nome>}    & PeerCli $\rightarrow$ MasterClient.whoHas \\
+\texttt{add <nome> <txt>} & PeerCli $\rightarrow$ ResourceManager.add; MasterClient.register \\
+\texttt{download <nome>}  & PeerCli $\rightarrow$ PeerClient.download; MasterClient.releaseToken/notifyFailed \\
+\texttt{quit}             & PeerCli $\rightarrow$ MasterClient.peerQuit; PeerServer.shutdown \\
+\bottomrule
+\end{tabular}
+
+\subsection*{Rischi, limiti e alternative considerate}
+\begin{itemize}[nosep]
+  \item \textbf{Serializzazione server}: \texttt{Semaphore(1)} rispetta il requisito “una richiesta alla volta”, limitando throughput; alternativa: coda con back-pressure e finestra di 1 richiesta (semantica identica) o validazione token lato peer con round-trip al Master.
+  \item \textbf{Retry lato client}: oggi \emph{best-effort} sul primo candidato dal Master; alternative: round-robin sui candidati o politica LRU.
+  \item \textbf{Header fisso \texttt{OK <size>}}: semplice e interoperabile; alternativa: framing binario con length-prefix su 4 byte, ma non necessario per la specifica.
+\end{itemize}
+
+
+\section{Codice comune e utility: strutture dati, codec e I/O di rete}
+
+Questa sezione documenta le classi condivise tra Master e Peer, responsabili di serializzazione JSON, messaggistica, utilità di rete e descrizione dei peer. Le decisioni progettuali puntano a mantenere un protocollo line-based semplice, con payload JSON tipizzati e strutture dati minime ma esplicite.
+
+\subsection*{PeerRef.java e PeerInfo.java}
+\texttt{PeerRef} descrive come contattare un peer: \texttt{peerId}, \texttt{host}, \texttt{port}. \texttt{PeerInfo} (se presente) incapsula metadati non strettamente necessari alla connessione (per esempio stato o ultimo seen).
+\begin{lstlisting}
+/** Riferimento contattabile a un peer. */
+public final class PeerRef {
+  private final String peerId;
+  private final String host;
+  private final int port;
+
+  public String peerId() { return peerId; }
+  public String host()   { return host; }
+  public int    port()   { return port; }
+
+  @Override public String toString() {
+    return peerId + " " + host + ":" + port;
+  }
+}
+\end{lstlisting}
+Collegamenti:
+\begin{itemize}[nosep]
+  \item Nel Master: \texttt{Registry} mantiene mappe \texttt{peerId} $\rightarrow$ \texttt{PeerRef} e \texttt{resource} $\rightarrow$ \{\texttt{peerId}\}.
+  \item Nel Peer: \texttt{MasterClient} scambia \texttt{PeerRef} per \texttt{REGISTER}, \texttt{WHO\_HAS} e \texttt{DOWNLOAD\_TOKEN\_REQ}.
+\end{itemize}
+Scelta: \texttt{PeerRef} immutabile, adatto a snapshot e a essere serializzato in JSON.
+
+\subsection*{Token.java}
+Rappresenta il permesso temporaneo a scaricare una risorsa, con valore (UUID), risorsa associata, destinatario e scadenza.
+\begin{lstlisting}
+public final class Token {
+  private final String value;        // UUID
+  private final String resource;     // nome risorsa
+  private final String toPeerId;     // destinatario
+  private final Instant expiresAt;   // scadenza
+
+  public String  value()    { return value; }
+  public String  resource() { return resource; }
+  public String  toPeerId() { return toPeerId; }
+  public Instant expiresAt(){ return expiresAt; }
+
+  @Override public String toString() { return value; }
+}
+\end{lstlisting}
+Collegamenti:
+\begin{itemize}[nosep]
+  \item Emesso/validato/revocato da \texttt{TokenStore}.
+  \item Trasportato in \texttt{TokenResp} tra Master e Peer tramite \texttt{JsonCodec}.
+\end{itemize}
+Scelta: modello minimale e immutabile, favorisce validazioni semplici e passaggio sicuro tra thread.
+
+\subsection*{Message.java}
+Convenzioni per i payload JSON del protocollo; tipicamente record/dto interni a \texttt{ClientHandler} e a \texttt{MasterClient}. In alcuni casi il progetto definisce contenitori generici (per esempio \texttt{ListResp}, \texttt{PeersResp}, \texttt{TokenReq}, \texttt{TokenResp}, ecc.).
+\begin{lstlisting}
+// Esempi di DTO/record per il payload JSON.
+public record RegisterReq(PeerRef ref, List<String> resources) {}
+public record WhoHasReq(String resource) {}
+public record PeersResp(List<PeerRef> peers) {}
+public record TokenReq(String resource, String requesterPeerId) {}
+public record TokenResp(Token token, PeerRef sourceRef) {}
+public record TokenRel(String token, String resource, String fromPeerId, String requesterPeerId) {}
+public record DownloadFailedReq(String resource, String fromPeerId, String requesterPeerId) {}
+\end{lstlisting}
+Collegamenti:
+\begin{itemize}[nosep]
+  \item Master: \texttt{ClientHandler} usa questi dto per il parse dei payload e la costruzione delle risposte.
+  \item Peer: \texttt{MasterClient} li costruisce e li decodifica su risposta del Master.
+\end{itemize}
+Scelta: record Java per verbosità ridotta, immutabilità e serializzazione diretta.
+
+\subsection*{JsonCodec.java}
+Adapter centralizzato per serializzare/deserializzare i DTO in JSON, astratto dalla libreria concreta (Jackson/Gson).
+\begin{lstlisting}
+public final class JsonCodec {
+  private static final ObjectMapper M = new ObjectMapper();
+
+  public static String toJson(Object o) {
+    try { return M.writeValueAsString(o); }
+    catch (Exception e) { throw new IllegalArgumentException("json-encode", e); }
+  }
+
+  public static <T> T fromJson(String s, Class<T> type) {
+    try { return M.readValue(s, type); }
+    catch (Exception e) { throw new IllegalArgumentException("json-decode", e); }
+  }
+}
+\end{lstlisting}
+Collegamenti:
+\begin{itemize}[nosep]
+  \item Master: \texttt{ClientHandler} decodifica richieste e codifica risposte \texttt{OK <json>}.
+  \item Peer: \texttt{MasterClient} costruisce richieste e decodifica le risposte del Master.
+\end{itemize}
+Scelte:
+\begin{itemize}[nosep]
+  \item Centralizzare qui evita dipendenze dirette dalla libreria JSON in tutto il codice.
+  \item Eccezione unchecked per semplificare i flussi line-based e fallire veloce su input malformati.
+\end{itemize}
+
+\subsection*{NetUtils.java}
+Utility I/O per protocollo line-based su socket, con charset fissato a UTF-8 e \emph{auto-flush} esplicito.
+\begin{lstlisting}
+public final class NetUtils {
+  private static final Charset CS = StandardCharsets.UTF_8;
+
+  public static void sendLine(Writer out, String line) throws IOException {
+    out.write(line); out.write("\n"); out.flush();
+  }
+
+  public static BufferedReader newReader(InputStream in) {
+    return new BufferedReader(new InputStreamReader(in, CS));
+  }
+
+  public static BufferedWriter newWriter(OutputStream out) {
+    return new BufferedWriter(new OutputStreamWriter(out, CS));
+  }
+}
+\end{lstlisting}
+Collegamenti:
+\begin{itemize}[nosep]
+  \item Master: \texttt{ClientHandler} invia \texttt{OK ...} o \texttt{ERR ...}.
+  \item Peer: \texttt{PeerClient} e \texttt{PeerRequestHandler} scambiano header e comandi.
+\end{itemize}
+Scelte:
+\begin{itemize}[nosep]
+  \item Separare \texttt{Reader}/\texttt{Writer} dall’\texttt{InputStream} crudo usato per i byte del file.
+  \item \texttt{flush()} esplicito dopo ogni linea per evitare deadlock con buffer residui.
+\end{itemize}
+
+\subsection*{Integrazione tra i moduli e contratti di validazione}
+
+\paragraph{Contratti lato Master}
+\begin{itemize}[nosep]
+  \item Ogni risposta usa il formato \texttt{OK <json>} o \texttt{ERR <motivo>}.
+  \item \texttt{TokenStore.get(value)} invalida i token scaduti; \texttt{DOWNLOAD\_TOKEN\_REL} revoca sempre il token.
+  \item \texttt{Registry.removePeerResource(peerId, resource)} viene invocato su \texttt{DOWNLOAD\_FAILED} per mantenere coerenti gli indici.
+\end{itemize}
+
+\paragraph{Contratti lato Peer}
+\begin{itemize}[nosep]
+  \item \texttt{PeerClient} verifica l’header \texttt{OK <size>} prima di ricevere il flusso binario.
+  \item \texttt{PeerServer} serve una sola richiesta alla volta (\texttt{Semaphore(1)}); \texttt{PeerRequestHandler} rilascia la semafora in \texttt{finally}.
+  \item Dopo \texttt{add} o modifica risorse, la CLI invia \texttt{REGISTER} per aggiornare il Master.
+\end{itemize}
+
+\paragraph{Motivazioni complessive}
+\begin{itemize}[nosep]
+  \item Line-based + JSON: parsing semplice, estendibile, adatto a log e debug.
+  \item Modelli immutabili (\texttt{PeerRef}, \texttt{Token}, DTO record): riducono bug di concorrenza e facilitano snapshot.
+  \item I/O separato testo/binario: header umani e trasferimento byte-preciso.
+\end{itemize}
+
+
+
+\section{Appendice A: Esempi di comandi}
+\subsection*{Master}
+\begin{lstlisting}
+listdata
+inspectNodes
+log
+quit
+\end{lstlisting}
+
+\subsection*{Peer}
+\begin{lstlisting}
+listdata local
+add R3.txt hello
+listdata remote
+listpeers
+whohas R3.txt
+download R3.txt
+quit
+\end{lstlisting}
+
+\section{Appendice B: Suggerimenti di debug}
+\begin{itemize}[nosep]
+  \item Se \texttt{mvn clean} fallisce: chiudere tutti i \texttt{java.exe}, poi ripetere.
+  \item Se \texttt{REGISTER} fallisce: controllare che il Master risponda \texttt{OK} (anche senza payload).
+  \item Se \texttt{download} resta appeso: controllare che il peer sorgente sia avviato e che risponda \texttt{OK <size>}.
+  \item Per simulare concorrenza: avviare due download in parallelo verso lo stesso peer.
+\end{itemize}
+
+\end{document}

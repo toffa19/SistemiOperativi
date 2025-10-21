@@ -1,0 +1,1 @@
+package it.unibo.labso.p2p.common; public record PeerInfo(String id, String host, int port) {}

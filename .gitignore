@@ -1,0 +1,21 @@
+﻿# Java / Maven
+target/
+*.class
+*.log
+dependency-reduced-pom.xml
+
+# IntelliJ / VS Code
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts
+*.aux
+*.synctex.gz
+*.toc
+*.out
+*.log
